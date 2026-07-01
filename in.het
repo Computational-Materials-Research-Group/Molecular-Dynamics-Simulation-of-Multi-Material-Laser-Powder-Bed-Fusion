@@ -1,0 +1,323 @@
+# ============================================================
+#  LAMMPS: LPBF Multi-Material (Al substrate + Al/Cu powder)
+#  Dense powder bed: base layer + stacked spheres, forced
+#  dissimilar-material contacts (Al-Cu touching), NO cooling stage
+#  Cite: MISHRA, A. (2026). Atomistic Modeling of Laser Powder Bed
+#  Fusion Process. Zenodo. https://doi.org/10.5281/zenodo.19438365
+#
+#  PREREQUISITE — run BEFORE this script:
+#      python3 generate_powder_spheres.py
+#
+#  FIX HISTORY:
+#  - delete_atoms overlap removes coincident Al/Cu atoms created
+#    where sphere regions deliberately overlap for contact.
+#  - delete_atoms needs pair_style + masses defined first (it
+#    builds a neighbor list) -> potential section MOVED UP to
+#    before delete_atoms, not after.
+# ============================================================
+
+# -------------------------------------------------------
+# 0. USER PARAMETERS
+# -------------------------------------------------------
+variable  a0           equal  4.05
+variable  T_bed        equal  300
+variable  seed         equal  42
+
+variable  scan_speed   equal  0.4
+variable  laser_radius equal  50.0
+variable  laser_power  equal  0.40
+variable  dt           equal  0.001
+
+variable  equil_steps  equal  400000
+
+variable  freq_equil   equal  500
+variable  freq_laser   equal  1
+
+# -------------------------------------------------------
+# 1. INITIALIZATION
+# -------------------------------------------------------
+units         metal
+dimension     3
+atom_style    atomic
+boundary      p p f
+
+# -------------------------------------------------------
+# 2. GEOMETRY
+# -------------------------------------------------------
+variable  Nx_sub       equal  62
+variable  Ny_sub       equal  111
+
+variable  Nz_fixed     equal  3
+variable  Nz_therm     equal  2
+variable  Nz_conduct   equal  3
+variable  Nz_sub       equal  "v_Nz_fixed + v_Nz_therm + v_Nz_conduct"
+
+variable  R_pow        equal  24.9
+variable  D_pow        equal  "2.0 * v_R_pow"
+variable  spc          equal  "v_D_pow + 5.0"
+
+variable  sub_zhi_l    equal  "v_Nz_sub * v_a0"
+variable  sphere_gap   equal  3.0
+variable  pow_z0       equal  "v_sub_zhi_l + v_R_pow + v_sphere_gap"
+
+variable  stack_layers equal  3.0
+variable  box_zhi      equal  "v_sub_zhi_l + v_stack_layers*v_D_pow + v_sphere_gap + 30.0"
+variable  box_zhi_latt equal  "v_box_zhi / v_a0"
+
+variable  z_fix_hi     equal  "v_Nz_fixed * v_a0"
+variable  z_therm_hi   equal  "(v_Nz_fixed + v_Nz_therm) * v_a0"
+variable  z_conduct_hi equal  "v_sub_zhi_l"
+
+print "=== LAYER BOUNDARIES ==="
+print "  Fixed      : 0.0 to ${z_fix_hi} Ang (${Nz_fixed} unit cells)"
+print "  Thermostat : ${z_fix_hi} to ${z_therm_hi} Ang"
+print "  Conduction : ${z_therm_hi} to ${z_conduct_hi} Ang"
+print "  Substrate top: ${z_conduct_hi} Ang"
+print "  Powder base plane (approx): ${pow_z0} Ang"
+print "  Box top (with stack headroom): ${box_zhi} Ang"
+print "========================"
+
+# -------------------------------------------------------
+# 3. BUILD BOX + SUBSTRATE
+# -------------------------------------------------------
+lattice  fcc ${a0} orient x 1 0 0 orient y 0 1 0 orient z 0 0 1
+
+region   reg_box block 0 ${Nx_sub} 0 ${Ny_sub} 0 ${box_zhi_latt} units lattice
+
+create_box  2 reg_box
+
+region   reg_sub block 0 ${Nx_sub} 0 ${Ny_sub} 0 ${Nz_sub} units lattice
+create_atoms 1 region reg_sub
+
+variable  sub_zhi  equal  "v_Nz_sub * v_a0"
+
+print "Substrate atom count: $(count(all))"
+
+# -------------------------------------------------------
+# 4. CREATE POWDER SPHERES — base layer + stacked, Al/Cu
+# -------------------------------------------------------
+include powder_spheres.lmp
+
+print "Total atom count after powder creation (before cleanup): $(count(all))"
+
+change_box all boundary p p s
+
+# -------------------------------------------------------
+# 5. POTENTIAL — MOVED UP so masses/pair_style exist BEFORE
+#    delete_atoms overlap runs (delete_atoms builds a neighbor
+#    list and errors out if masses aren't set yet).
+# -------------------------------------------------------
+pair_style   eam/alloy
+pair_coeff   * * CuAlW.txt Al Cu
+
+mass         1  26.982     # Al
+mass         2  63.546     # Cu
+
+neighbor      3.0 bin
+neigh_modify  every 1 delay 0 check yes page 100000 one 2000
+
+# -------------------------------------------------------
+# 6. CRITICAL FIX — remove coincident/too-close atoms
+# -------------------------------------------------------
+# Where an Al sphere region and a Cu sphere region geometrically
+# overlap (deliberately, for contact/necking), the two separate
+# create_atoms calls each place an atom at the SAME lattice site.
+# Two atoms at ~zero separation produce infinite EAM pair energy
+# and crash the minimizer with "Non-numeric atom coords".
+delete_atoms overlap 2.0 all all
+print "--- Overlapping/coincident atoms removed ---"
+print "Total atom count after cleanup: $(count(all))"
+
+# -------------------------------------------------------
+# 7. GROUPS
+# -------------------------------------------------------
+region  reg_fixed    block INF INF INF INF 0.0            ${z_fix_hi}    units box
+region  reg_therm    block INF INF INF INF ${z_fix_hi}    ${z_therm_hi}  units box
+region  reg_conduct  block INF INF INF INF ${z_therm_hi}  ${z_conduct_hi} units box
+region  reg_powders  block INF INF INF INF ${z_conduct_hi} INF           units box
+
+group  g_fixed    region reg_fixed
+group  g_therm    region reg_therm
+group  g_conduct  region reg_conduct
+group  g_powders  region reg_powders
+
+group  g_nve_only union g_conduct g_powders
+group  g_mobile   subtract all g_fixed
+
+group  g_Al  type 1
+group  g_Cu  type 2
+
+# -------------------------------------------------------
+# 8. COMPUTES
+# -------------------------------------------------------
+compute  cna      all  cna/atom 3.5
+compute  pe_atom  all  pe/atom
+compute  ke_atom  all  ke/atom
+compute  stress   all  stress/atom NULL virial
+
+variable  T_atom  atom  "c_ke_atom / (1.5 * 8.617e-5)"
+variable  S_hyd   atom  "-(c_stress[1]+c_stress[2]+c_stress[3])"
+variable  S_vm    atom  "sqrt(0.5*((c_stress[1]-c_stress[2])^2+(c_stress[2]-c_stress[3])^2+(c_stress[1]-c_stress[3])^2+6*(c_stress[4]^2+c_stress[5]^2+c_stress[6]^2)))"
+
+# -------------------------------------------------------
+# 8b. PRE-RELAXATION
+# -------------------------------------------------------
+fix       f_pre_f g_powders setforce 0.0 0.0 0.0
+min_style fire
+minimize  1.0e-3 1.0e-3 500 5000
+unfix     f_pre_f
+print "--- Pre-relaxation of powder contacts done ---"
+
+# -------------------------------------------------------
+# 9. THREE-STAGE MINIMIZATION
+# -------------------------------------------------------
+fix  fa_p g_powders  setforce 0.0 0.0 0.0
+fix  fa_f g_fixed    setforce 0.0 0.0 0.0
+min_style  quickmin
+minimize   1.0e-3 1.0e-3 3000 30000
+unfix fa_p
+unfix fa_f
+print "--- Min A done (substrate) ---"
+
+fix  fb_c g_conduct  setforce 0.0 0.0 0.0
+fix  fb_t g_therm    setforce 0.0 0.0 0.0
+fix  fb_f g_fixed    setforce 0.0 0.0 0.0
+min_style  quickmin
+minimize   1.0e-3 1.0e-3 3000 30000
+unfix fb_c
+unfix fb_t
+unfix fb_f
+print "--- Min B done (powders) ---"
+
+fix  fc_f g_fixed    setforce 0.0 0.0 0.0
+min_style  cg
+minimize   1.0e-6 1.0e-8 10000 100000
+unfix fc_f
+print "--- Min C done (full) ---"
+
+# -------------------------------------------------------
+# 10. INITIAL CHECK DUMP
+# -------------------------------------------------------
+timestep  ${dt}
+
+dump  d_check all custom 1 dump_00_check.lammpstrj  &
+      id type x y z c_cna c_pe_atom
+run   0
+undump d_check
+print "--- Check dump written. Verify spheres + stacking + materials in OVITO ---"
+
+# -------------------------------------------------------
+# 11. VELOCITY INITIALIZATION
+# -------------------------------------------------------
+velocity  g_mobile create ${T_bed} ${seed} mom yes rot yes dist gaussian
+velocity  g_fixed  set 0.0 0.0 0.0
+
+# -------------------------------------------------------
+# 12. FIX DEFINITIONS
+# -------------------------------------------------------
+fix  f_fixed    g_fixed    setforce 0.0 0.0 0.0
+
+fix  f_lang     g_therm    langevin ${T_bed} ${T_bed} $(10*dt) ${seed}
+fix  f_nve_th   g_therm    nve
+
+fix  f_nve_mob  g_nve_only nve
+
+# -------------------------------------------------------
+# 13. NVE/LIMIT WARM-UP
+# -------------------------------------------------------
+unfix  f_nve_mob
+fix    f_nvelim g_nve_only nve/limit 0.05
+
+thermo       50
+thermo_style custom step temp pe ke press atoms
+
+run   200
+
+unfix  f_nvelim
+fix    f_nve_mob g_nve_only nve
+
+velocity  g_therm scale ${T_bed}
+
+print "--- Warm-up done. Thermostat rescaled to ${T_bed} K ---"
+
+# -------------------------------------------------------
+# 14. STAGE 1 — EQUILIBRATION
+# -------------------------------------------------------
+compute  T_therm  g_therm   temp
+compute  T_pow    g_powders temp
+compute  T_Al     g_Al      temp
+compute  T_Cu     g_Cu      temp
+
+dump  MASTER all custom ${freq_equil} dump_ALL.lammpstrj  &
+      id type x y z                                        &
+      c_cna c_pe_atom c_ke_atom v_T_atom                  &
+      c_stress[1] c_stress[2] c_stress[3]                 &
+      c_stress[4] c_stress[5] c_stress[6]                 &
+      v_S_hyd v_S_vm
+dump_modify  MASTER sort id append no
+
+thermo       5000
+thermo_style custom step temp c_T_therm c_T_pow c_T_Al c_T_Cu pe ke press atoms
+
+print "--- Stage 1: EQUILIBRATION ---"
+run   ${equil_steps}
+
+undump  MASTER
+print "--- Equilibration done ---"
+
+# -------------------------------------------------------
+# 15. STAGE 2 — LASER SCAN
+# -------------------------------------------------------
+variable  laser_cx  equal  "lx / 2.0"
+variable  laser_zlo equal  "${sub_zhi} - 5.0"
+variable  t_now     equal  "step * dt"
+variable  laser_y   equal  "v_scan_speed * v_t_now"
+
+region  laser_zone cylinder z ${laser_cx} v_laser_y      &
+        ${laser_radius} ${laser_zlo} INF                  &
+        units box move 0 v_scan_speed 0
+
+group   g_laser  dynamic all region laser_zone every 1
+fix     f_laser  g_laser  heat 1 ${laser_power}
+
+variable  scan_time  equal  "ly / v_scan_speed"
+variable  scan_steps equal  round(v_scan_time / v_dt)
+
+dump  MASTER all custom ${freq_laser} dump_ALL.lammpstrj  &
+      id type x y z                                        &
+      c_cna c_pe_atom c_ke_atom v_T_atom                  &
+      c_stress[1] c_stress[2] c_stress[3]                 &
+      c_stress[4] c_stress[5] c_stress[6]                 &
+      v_S_hyd v_S_vm
+dump_modify  MASTER sort id append yes
+
+thermo       100
+thermo_style custom step temp c_T_therm c_T_pow c_T_Al c_T_Cu pe ke press atoms
+
+print "--- Stage 2: LASER SCAN ---"
+run  ${scan_steps}
+
+unfix   f_laser
+undump  MASTER
+print "--- Laser scan done ---"
+
+# -------------------------------------------------------
+# 16. FINAL FRAME + OUTPUT (no cooling stage)
+# -------------------------------------------------------
+dump  MASTER all custom 1 dump_ALL.lammpstrj               &
+      id type x y z                                         &
+      c_cna c_pe_atom c_ke_atom v_T_atom                   &
+      c_stress[1] c_stress[2] c_stress[3]                  &
+      c_stress[4] c_stress[5] c_stress[6]                  &
+      v_S_hyd v_S_vm
+dump_modify  MASTER sort id append yes
+run   0
+undump  MASTER
+
+write_data     al_cu_pbf_final.data
+write_restart  al_cu_pbf_final.restart
+
+print "======================================================="
+print " DONE — dump_ALL.lammpstrj contains all stages"
+print " (Equilibration + Laser Scan only — NO cooling stage)"
+print "======================================================="
